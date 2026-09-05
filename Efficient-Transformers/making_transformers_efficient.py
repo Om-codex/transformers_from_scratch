@@ -39,6 +39,11 @@ accuracy_score = load("accuracy")
 
 """## **The benchmark class**"""
 
+import numpy as np
+import torch
+from pathlib import Path
+from time import perf_counter
+
 class PerformanceBenchmark:
   def __init__(
       self,
@@ -47,7 +52,7 @@ class PerformanceBenchmark:
       optim_type = "BERT baseline"
   ):
     self.pipeline = pipeline
-    self.datset = dataset
+    self.dataset = dataset
     self.optim_type = optim_type
 
   # computing accuracy
@@ -68,12 +73,34 @@ class PerformanceBenchmark:
         predictions = preds,
         references = labels
     )
+    print(f"Accuracy on test set - {accuracy['accuracy']:.3f}")
+    return accuracy
 
   def compute_size(self):
-    pass
+    state_dict = self.pipeline.model.state_dict()
+    tmp_path = Path("model.pt")
+    torch.save(state_dict, tmp_path)
+    size_mb = Path(tmp_path).stat().st_size / (1024*1024)
+    tmp_path.unlink()
+    print(f"Model size (MB) - {size_mb:.2f}")
+    return {"size_mb": size_mb}
 
   def time_pipeline(self):
-    pass
+    latencies = []
+    # warmup
+    for _ in range(10):
+      _ = self.pipeline(query)
+      # Timed run
+      for _ in range(100):
+        start_time = perf_counter()
+        _ = self.pipeline(query)
+        latency = perf_counter() - start_time
+        latencies.append(latency)
+      # Compute run statistics
+      time_avg_ms = 1000 * np.mean(latencies)
+      time_std_ms = 1000 * np.std(latencies)
+      print(f"Average latency (ms) - {time_avg_ms:.2f} + \\- {time_std_ms:.2f}")
+      return {"time_avg_ms": time_avg_ms, "time_std_ms": time_std_ms}
 
   def run_benchmark(self):
     metrics = {}
@@ -82,3 +109,44 @@ class PerformanceBenchmark:
     metrics[self.optim_type].update(self.compute_accuracy())
 
     return metrics
+
+pb = PerformanceBenchmark(pipe, clinc["test"])
+perf_metrics = pb.run_benchmark()
+
+from transformers import TrainingArguments
+
+class DistillationTrainingArguments(TrainingArguments):
+  def __init__(self, *args, alpha = 0.5, temperature = 2.0, **kwargs):
+    super().__init__(*args, **kwargs)
+    self.alpha = alpha
+    self.temperature = temperature
+
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import Trainer
+
+class DistillationTrainer(Trainer):
+
+  def __init__(self, *args, teacher_model = None, **kwargs):
+    super().__init__(*args, **kwargs)
+    self.teacher_model = teacher_model
+
+  def compute_loss(self, model, inputs, return_outputs = False):
+    outputs_stu = model(**inputs)
+    # Extract cross-entropy loss and logits from student model
+    loss_ce = outputs_stu.loss
+    logits_stu = outputs_stu.logits
+    # Extract logits from teacher
+    with torch.no_grad(): # --> since we are not trainning the teacher model
+      outputs_tea = self.teacher_model(**inputs)
+      logits_tea = outputs_tea.logits
+    # soften probabilities and compute distillation loss
+    loss_fct = nn.KLDivLoss(reduction = "batchmean")
+    loss_kd = self.args.temperature ** 2 * loss_fct(
+        F.log_softmax(logits_stu / self.args.temperature, dim = -1),
+        F.softmax(logits_tea / self.args.temperature, dim = -1)
+    )
+    # Return weighted student loss
+    loss = self.args.alpha * loss_ce + (1. - self.args.alpha) * loss_kd
+    return (loss, outputs_stu) if return_outputs else loss
+
